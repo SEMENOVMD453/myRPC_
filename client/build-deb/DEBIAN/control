@@ -1,0 +1,7 @@
+Package: myRPC-client
+Version: 1.0
+Section: base
+Priority: optional
+Architecture: amd64
+Maintainer: AACnotAliVe <mrlenorgenri@gmail.com>
+Description: myRPC-client program

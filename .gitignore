@@ -1,0 +1,10 @@
+/build/
+/repo/
+/*.deb
+*.o
+*.a
+*.so
+*.log
+*.deb
+/daemon/
+Packages.gz
