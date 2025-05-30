@@ -1,28 +1,28 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <json-c/json.h>
-#include <signal.h>
 #include <sys/stat.h>
+#include <json-c/json.h>
 #include "mysyslog.h"
 
-#define BUFFER_CAP 4096
+#define MSG_BUFFER 4096
 
-int verify_user(const char *username) {
+int auth_user(const char *login_name) {
     FILE *fp = fopen("/etc/myRPC/users.conf", "r");
     if (!fp) return 0;
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\n")] = 0;
-        if (strcmp(line, username) == 0) {
+    char temp[128];
+    while (fgets(temp, sizeof(temp), fp)) {
+        temp[strcspn(temp, "\n")] = '\0';
+        if (strcmp(temp, login_name) == 0) {
             fclose(fp);
             return 1;
         }
@@ -31,188 +31,186 @@ int verify_user(const char *username) {
     return 0;
 }
 
-char *trim_spaces(char *input) {
-    while (*input == ' ' || *input == '\t') input++;
-    char *end = input + strlen(input) - 1;
-    while (end > input && (*end == ' ' || *end == '\t')) *end-- = 0;
-    return input;
+char *sanitize_line(char *input_line) {
+    while (*input_line == ' ' || *input_line == '\t') input_line++;
+    char *endptr = input_line + strlen(input_line) - 1;
+    while (endptr > input_line && (*endptr == ' ' || *endptr == '\t')) *endptr-- = 0;
+    return input_line;
 }
 
-char *shell_escape(const char *src) {
+char *quote_shell_arg(const char *src) {
     size_t len = strlen(src);
     char *escaped = malloc(len * 4 + 3);
     if (!escaped) return NULL;
-    char *ptr = escaped;
-    *ptr++ = ''';
+    char *q = escaped;
+    *q++ = ''';
     for (size_t i = 0; i < len; ++i) {
         if (src[i] == '\'') {
-            memcpy(ptr, "'\\\''", 4);
-            ptr += 4;
+            memcpy(q, "'\\\''", 4);
+            q += 4;
         } else {
-            *ptr++ = src[i];
+            *q++ = src[i];
         }
     }
-    *ptr++ = ''';
-    *ptr = 0;
+    *q++ = ''';
+    *q = '\0';
     return escaped;
 }
 
-char *read_file(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) return strdup("(no data)");
+char *read_file_content(const char *filepath) {
+    FILE *f = fopen(filepath, "r");
+    if (!f) return strdup("(unreadable)");
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char *content = malloc(size + 1);
-    if (!content) return strdup("(mem fail)");
-    fread(content, 1, size, f);
-    content[size] = 0;
+    long len = ftell(f);
+    rewind(f);
+    char *buffer = malloc(len + 1);
+    if (!buffer) return strdup("(alloc fail)");
+    fread(buffer, 1, len, f);
+    buffer[len] = '\0';
     fclose(f);
-    return content;
+    return buffer;
 }
 
-void handle_request(const char *json_req, char *response_out) {
-    struct json_object *input = json_tokener_parse(json_req);
-    struct json_object *output = json_object_new_object();
+void handle_rpc_json(const char *input_json, char *output_json) {
+    struct json_object *json_in = json_tokener_parse(input_json);
+    struct json_object *json_out = json_object_new_object();
 
-    if (!input) {
-        json_object_object_add(output, "code", json_object_new_int(1));
-        json_object_object_add(output, "result", json_object_new_string("Bad JSON"));
-        strcpy(response_out, json_object_to_json_string(output));
-        json_object_put(output);
+    if (!json_in) {
+        json_object_object_add(json_out, "code", json_object_new_int(400));
+        json_object_object_add(json_out, "msg", json_object_new_string("Malformed JSON"));
+        strcpy(output_json, json_object_to_json_string(json_out));
+        json_object_put(json_out);
         return;
     }
 
-    const char *login = json_object_get_string(json_object_object_get(input, "login"));
-    const char *cmd = json_object_get_string(json_object_object_get(input, "command"));
+    const char *uname = json_object_get_string(json_object_object_get(json_in, "login"));
+    const char *cmd = json_object_get_string(json_object_object_get(json_in, "command"));
 
-    if (!login || !cmd) {
-        json_object_object_add(output, "code", json_object_new_int(1));
-        json_object_object_add(output, "result", json_object_new_string("Invalid fields"));
-    } else if (!verify_user(login)) {
-        json_object_object_add(output, "code", json_object_new_int(1));
-        json_object_object_add(output, "result", json_object_new_string("Access denied"));
+    if (!uname || !cmd) {
+        json_object_object_add(json_out, "code", json_object_new_int(422));
+        json_object_object_add(json_out, "msg", json_object_new_string("Missing fields"));
+    } else if (!auth_user(uname)) {
+        json_object_object_add(json_out, "code", json_object_new_int(403));
+        json_object_object_add(json_out, "msg", json_object_new_string("Unauthorized"));
     } else {
-        char tempfile[] = "/tmp/mrpc_XXXXXX";
-        int tmpfd = mkstemp(tempfile);
+        char temp_path[] = "/tmp/cmdexec_XXXXXX";
+        int tmpfd = mkstemp(temp_path);
         if (tmpfd < 0) {
-            log_error("tmpfile: %s", strerror(errno));
-            json_object_object_add(output, "code", json_object_new_int(1));
-            json_object_object_add(output, "result", json_object_new_string("Tmp fail"));
+            log_error("mkstemp failed: %s", strerror(errno));
+            json_object_object_add(json_out, "code", json_object_new_int(500));
+            json_object_object_add(json_out, "msg", json_object_new_string("Temp error"));
         } else {
             close(tmpfd);
-            char fout[256], ferr[256];
-            snprintf(fout, sizeof(fout), "%s.out", tempfile);
-            snprintf(ferr, sizeof(ferr), "%s.err", tempfile);
+            char stdout_file[256], stderr_file[256];
+            snprintf(stdout_file, sizeof(stdout_file), "%s.out", temp_path);
+            snprintf(stderr_file, sizeof(stderr_file), "%s.err", temp_path);
 
-            char *safe = shell_escape(cmd);
-            if (!safe) {
-                json_object_object_add(output, "code", json_object_new_int(1));
-                json_object_object_add(output, "result", json_object_new_string("Mem error"));
+            char *cmd_safe = quote_shell_arg(cmd);
+            if (!cmd_safe) {
+                json_object_object_add(json_out, "code", json_object_new_int(500));
+                json_object_object_add(json_out, "msg", json_object_new_string("Memory error"));
             } else {
-                char exec_line[1024];
-                snprintf(exec_line, sizeof(exec_line), "sh -c %s > %s 2> %s", safe, fout, ferr);
-                free(safe);
-                int ret = system(exec_line);
-                char *msg = read_file(ret == 0 ? fout : ferr);
-                json_object_object_add(output, "code", json_object_new_int(ret == 0 ? 0 : 1));
-                json_object_object_add(output, "result", json_object_new_string(msg));
-                free(msg);
+                char sh_cmd[1024];
+                snprintf(sh_cmd, sizeof(sh_cmd), "sh -c %s > %s 2> %s", cmd_safe, stdout_file, stderr_file);
+                free(cmd_safe);
+                int rc = system(sh_cmd);
+                char *result_text = read_file_content(rc == 0 ? stdout_file : stderr_file);
+                json_object_object_add(json_out, "code", json_object_new_int(rc == 0 ? 0 : 1));
+                json_object_object_add(json_out, "msg", json_object_new_string(result_text));
+                free(result_text);
             }
         }
     }
 
-    strcpy(response_out, json_object_to_json_string(output));
-    json_object_put(input);
-    json_object_put(output);
+    strcpy(output_json, json_object_to_json_string(json_out));
+    json_object_put(json_in);
+    json_object_put(json_out);
 }
 
 int main() {
-    log_info("Daemon Init");
+    log_info("RPC Service Init");
 
-    int port_num = 1234;
-    int tcp = 1;
+    int port = 1234;
+    int tcp_proto = 1;
 
-    FILE *config = fopen("/etc/myRPC/myRPC.conf", "r");
-    if (config) {
-        char buf[256];
-        while (fgets(buf, sizeof(buf), config)) {
-            buf[strcspn(buf, "\n")] = 0;
-            char *line = trim_spaces(buf);
-            if (line[0] == '#' || strlen(line) == 0) continue;
-            if (strstr(line, "port")) sscanf(line, "port = %d", &port_num);
-            else if (strstr(line, "socket_type")) {
-                char proto[16];
-                if (sscanf(line, "socket_type = %15s", proto) == 1) tcp = strcmp(proto, "dgram") != 0;
+    FILE *cfgf = fopen("/etc/myRPC/myRPC.conf", "r");
+    if (cfgf) {
+        char lbuf[256];
+        while (fgets(lbuf, sizeof(lbuf), cfgf)) {
+            lbuf[strcspn(lbuf, "\n")] = '\0';
+            char *entry = sanitize_line(lbuf);
+            if (*entry == '#' || !*entry) continue;
+            if (strstr(entry, "port")) sscanf(entry, "port = %d", &port);
+            else if (strstr(entry, "socket_type")) {
+                char t[16];
+                if (sscanf(entry, "socket_type = %15s", t) == 1) tcp_proto = strcmp(t, "dgram") != 0;
             }
         }
-        fclose(config);
+        fclose(cfgf);
     } else {
-        log_warning("Config missing: %s", strerror(errno));
+        log_warning("No config: %s", strerror(errno));
     }
 
-    int srv_sock = socket(AF_INET, tcp ? SOCK_STREAM : SOCK_DGRAM, 0);
-    if (srv_sock < 0) {
-        log_error("Socket fail: %s", strerror(errno));
-        exit(1);
+    int sfd = socket(AF_INET, tcp_proto ? SOCK_STREAM : SOCK_DGRAM, 0);
+    if (sfd < 0) {
+        log_error("Socket error: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in srv_addr = {
+    struct sockaddr_in srv = {
         .sin_family = AF_INET,
-        .sin_port = htons(port_num),
+        .sin_port = htons(port),
         .sin_addr.s_addr = INADDR_ANY
     };
 
-    if (bind(srv_sock, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
-        log_error("Bind fail: %s", strerror(errno));
-        exit(1);
+    if (bind(sfd, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        log_error("Bind failed: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    if (tcp && listen(srv_sock, 5) < 0) {
-        log_error("Listen fail: %s", strerror(errno));
-        exit(1);
+    if (tcp_proto && listen(sfd, 5) < 0) {
+        log_error("Listen error: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    log_info("Daemon ready at %d/%s", port_num, tcp ? "TCP" : "UDP");
+    log_info("Listening on port %d via %s", port, tcp_proto ? "TCP" : "UDP");
 
     while (1) {
-        struct sockaddr_in cli_addr;
-        socklen_t cli_len = sizeof(cli_addr);
-        char buffer[BUFFER_CAP] = {0};
+        struct sockaddr_in cli;
+        socklen_t clen = sizeof(cli);
+        char input_buf[MSG_BUFFER] = {0};
 
-        if (tcp) {
-            int cli_sock = accept(srv_sock, (struct sockaddr *)&cli_addr, &cli_len);
-            if (cli_sock < 0) {
-                log_error("Accept fail: %s", strerror(errno));
+        if (tcp_proto) {
+            int csock = accept(sfd, (struct sockaddr *)&cli, &clen);
+            if (csock < 0) {
+                log_error("Accept failed: %s", strerror(errno));
                 continue;
             }
-            ssize_t rcv = recv(cli_sock, buffer, sizeof(buffer) - 1, 0);
-            if (rcv <= 0) {
-                log_error("TCP recv fail: %s", strerror(errno));
-                close(cli_sock);
+            ssize_t got = recv(csock, input_buf, sizeof(input_buf) - 1, 0);
+            if (got <= 0) {
+                log_error("TCP read failed: %s", strerror(errno));
+                close(csock);
                 continue;
             }
-            buffer[rcv] = 0;
-            log_info("TCP: %s", buffer);
-            char reply[BUFFER_CAP];
-            handle_request(buffer, reply);
-            send(cli_sock, reply, strlen(reply), 0);
-            close(cli_sock);
+            input_buf[got] = '\0';
+            char out_json[MSG_BUFFER];
+            handle_rpc_json(input_buf, out_json);
+            send(csock, out_json, strlen(out_json), 0);
+            close(csock);
         } else {
-            ssize_t rcv = recvfrom(srv_sock, buffer, sizeof(buffer) - 1, 0,
-                                   (struct sockaddr *)&cli_addr, &cli_len);
-            if (rcv < 0) {
-                log_error("UDP recvfrom fail: %s", strerror(errno));
+            ssize_t got = recvfrom(sfd, input_buf, sizeof(input_buf) - 1, 0,
+                                   (struct sockaddr *)&cli, &clen);
+            if (got < 0) {
+                log_error("UDP recv failed: %s", strerror(errno));
                 continue;
             }
-            buffer[rcv] = 0;
-            log_info("UDP: %s", buffer);
-            char reply[BUFFER_CAP];
-            handle_request(buffer, reply);
-            sendto(srv_sock, reply, strlen(reply), 0, (struct sockaddr *)&cli_addr, cli_len);
+            input_buf[got] = '\0';
+            char out_json[MSG_BUFFER];
+            handle_rpc_json(input_buf, out_json);
+            sendto(sfd, out_json, strlen(out_json), 0, (struct sockaddr *)&cli, clen);
         }
     }
 
-    close(srv_sock);
+    close(sfd);
     return 0;
 }
