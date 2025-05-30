@@ -1,0 +1,5 @@
+Package: myRPC-client
+Version: 1.0
+Architecture: amd64
+Maintainer: www.semyonov@mail.ru
+Description: RPC client
