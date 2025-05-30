@@ -10,141 +10,122 @@
 #include <arpa/inet.h>
 #include <errno.h>
 
-#define BUF_SIZE 4096  // Размер буфера для приёма данных
+#define MAX_DATA 4096
 
-// Функция вывода справки
-void print_usage(const char *prog) {
-    printf("Usage: %s [OPTIONS]\n", prog);
+void usage_guide(const char *progname) {
+    printf("Usage: %s [OPTIONS]\n", progname);
     printf("Options:\n");
-    printf("  -c, --command \"bash_command\"    Bash command to execute\n");
-    printf("  -h, --host \"ip_addr\"             Server IP address\n");
-    printf("  -p, --port PORT                  Server port\n");
-    printf("  -s, --stream                     Use stream (TCP) socket\n");
-    printf("  -d, --dgram                      Use datagram (UDP) socket\n");
-    printf("      --help                       Show this help message\n");
+    printf("  -x, --exec \"cmd\"       Command to execute\n");
+    printf("  -a, --addr \"ip\"        Target IP address\n");
+    printf("  -n, --net PORT         Target port\n");
+    printf("  -t, --tcp              Use TCP socket\n");
+    printf("  -u, --udp              Use UDP socket\n");
+    printf("      --help             Display help info\n");
 }
 
 int main(int argc, char *argv[]) {
-    char *command = NULL, *host = NULL;
-    int port = 0, use_stream = 0, use_dgram = 0;
+    char *cmdline = NULL, *ip_addr = NULL;
+    int netport = 0, tcp_flag = 0, udp_flag = 0;
 
-    // Определение поддерживаемых опций командной строки
-    static struct option long_options[] = {
-        {"command", required_argument, 0, 'c'},
-        {"host", required_argument, 0, 'h'},
-        {"port", required_argument, 0, 'p'},
-        {"stream", no_argument, 0, 's'},
-        {"dgram", no_argument, 0, 'd'},
+    static struct option opts[] = {
+        {"exec", required_argument, 0, 'x'},
+        {"addr", required_argument, 0, 'a'},
+        {"net", required_argument, 0, 'n'},
+        {"tcp", no_argument, 0, 't'},
+        {"udp", no_argument, 0, 'u'},
         {"help", no_argument, 0, 0},
         {0, 0, 0, 0}
     };
 
-    // Разбор аргументов командной строки
-    int opt, option_index = 0;
-    while ((opt = getopt_long(argc, argv, "c:h:p:sd", long_options, &option_index)) != -1) {
-        switch (opt) {
-            case 'c': command = strdup(optarg); break; // Команда для отправки на сервер
-            case 'h': host = strdup(optarg); break;    // IP адрес сервера
-            case 'p': port = atoi(optarg); break;      // Порт сервера
-            case 's': use_stream = 1; break;           // TCP
-            case 'd': use_dgram = 1; break;            // UDP
-            case 0:   // Обработка --help
-                if (strcmp(long_options[option_index].name, "help") == 0) {
-                    print_usage(argv[0]);
-                    exit(0);
+    int ch, idx = 0;
+    while ((ch = getopt_long(argc, argv, "x:a:n:tu", opts, &idx)) != -1) {
+        switch (ch) {
+            case 'x': cmdline = strdup(optarg); break;
+            case 'a': ip_addr = strdup(optarg); break;
+            case 'n': netport = atoi(optarg); break;
+            case 't': tcp_flag = 1; break;
+            case 'u': udp_flag = 1; break;
+            case 0:
+                if (strcmp(opts[idx].name, "help") == 0) {
+                    usage_guide(argv[0]);
+                    return 0;
                 }
                 break;
             default:
-                print_usage(argv[0]);
-                exit(EXIT_FAILURE);
+                usage_guide(argv[0]);
+                return EXIT_FAILURE;
         }
     }
 
-    // Проверка обязательных параметров
-    if (!command || !host || !port || (!use_stream && !use_dgram)) {
-        print_usage(argv[0]);
-        exit(EXIT_FAILURE);
+    if (!cmdline || !ip_addr || !netport || (!tcp_flag && !udp_flag)) {
+        usage_guide(argv[0]);
+        return EXIT_FAILURE;
     }
 
-    // Получение имени текущего пользователя
-    struct passwd *pw = getpwuid(getuid());
-    if (!pw) {
-        perror("getpwuid");
-        exit(EXIT_FAILURE);
+    struct passwd *user_info = getpwuid(getuid());
+    if (!user_info) {
+        perror("user lookup");
+        return EXIT_FAILURE;
     }
-    const char *username = pw->pw_name;
+    const char *login = user_info->pw_name;
 
-    // Формирование JSON-запроса
-    struct json_object *req = json_object_new_object();
-    json_object_object_add(req, "login", json_object_new_string(username));
-    json_object_object_add(req, "command", json_object_new_string(command));
-    const char *json_str = json_object_to_json_string(req);
+    struct json_object *payload = json_object_new_object();
+    json_object_object_add(payload, "login", json_object_new_string(login));
+    json_object_object_add(payload, "command", json_object_new_string(cmdline));
+    const char *request = json_object_to_json_string(payload);
 
-    // Создание сокета (TCP или UDP)
-    int sockfd;
-    struct sockaddr_in servaddr;
-    sockfd = socket(AF_INET, (use_stream ? SOCK_STREAM : SOCK_DGRAM), 0);
-    if (sockfd < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
+    int connfd;
+    struct sockaddr_in target;
+    connfd = socket(AF_INET, (tcp_flag ? SOCK_STREAM : SOCK_DGRAM), 0);
+    if (connfd < 0) {
+        perror("sock create");
+        return EXIT_FAILURE;
     }
 
-    // Настройка адреса сервера
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(port);
-    inet_pton(AF_INET, host, &servaddr.sin_addr);
+    target.sin_family = AF_INET;
+    target.sin_port = htons(netport);
+    inet_pton(AF_INET, ip_addr, &target.sin_addr);
 
-    if (use_stream) {
-        // TCP: установка соединения
-        if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
-            perror("connect");
-            close(sockfd);
-            exit(EXIT_FAILURE);
+    if (tcp_flag) {
+        if (connect(connfd, (struct sockaddr*)&target, sizeof(target)) < 0) {
+            perror("tcp connect");
+            close(connfd);
+            return EXIT_FAILURE;
         }
 
-        // Отправка запроса
-        send(sockfd, json_str, strlen(json_str), 0);
-
-        // Приём ответа
-        char buf[BUF_SIZE] = {0};
-        ssize_t n = recv(sockfd, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            buf[n] = '\0';
-            printf("Ответ сервера: %s\n", buf);
+        send(connfd, request, strlen(request), 0);
+        char response[MAX_DATA] = {0};
+        ssize_t rlen = recv(connfd, response, sizeof(response) - 1, 0);
+        if (rlen > 0) {
+            response[rlen] = '\0';
+            printf("Server reply: %s\n", response);
         } else {
-            perror("recv");
+            perror("tcp recv");
         }
 
     } else {
-        // UDP: установка таймаута на приём
-        struct timeval tv = {5, 0};
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        struct timeval timeout = {5, 0};
+        setsockopt(connfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-        // Отправка запроса
-        sendto(sockfd, json_str, strlen(json_str), 0, (struct sockaddr*)&servaddr, sizeof(servaddr));
-
-        // Приём ответа
-        char buf[BUF_SIZE] = {0};
-        socklen_t len = sizeof(servaddr);
-        ssize_t n = recvfrom(sockfd, buf, sizeof(buf) - 1, 0, (struct sockaddr*)&servaddr, &len);
-        if (n > 0) {
-            buf[n] = '\0';
-            printf("Ответ сервера: %s\n", buf);
+        sendto(connfd, request, strlen(request), 0, (struct sockaddr*)&target, sizeof(target));
+        char response[MAX_DATA] = {0};
+        socklen_t tlen = sizeof(target);
+        ssize_t rlen = recvfrom(connfd, response, sizeof(response) - 1, 0, (struct sockaddr*)&target, &tlen);
+        if (rlen > 0) {
+            response[rlen] = '\0';
+            printf("Server reply: %s\n", response);
         } else {
-            // Обработка таймаута
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                fprintf(stderr, "Timeout waiting for UDP response\n");
-            } else {
-                perror("recvfrom");
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                fprintf(stderr, "UDP response timeout\n");
+            else
+                perror("udp recvfrom");
         }
     }
 
-    // Очистка ресурсов
-    close(sockfd);
-    free(command);
-    free(host);
-    json_object_put(req);
+    close(connfd);
+    free(cmdline);
+    free(ip_addr);
+    json_object_put(payload);
 
     return 0;
 }
