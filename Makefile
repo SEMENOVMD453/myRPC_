@@ -6,14 +6,14 @@ REPO_DIR ?= $(CURDIR)/../myRPC-repo
 .PHONY: all clean deb
 
 all:
-	$(MAKE) -C src/mysyslog
-	$(MAKE) -C src/client
-	$(MAKE) -C src/server
+	$(MAKE) -C mysyslog
+	$(MAKE) -C client
+	$(MAKE) -C server
 
 clean:
-	$(MAKE) -C src/mysyslog clean
-	$(MAKE) -C src/client clean
-	$(MAKE) -C src/server clean
+	$(MAKE) -C mysyslog clean
+	$(MAKE) -C client clean
+	$(MAKE) -C server clean
 	rm -rf build-deb
 	rm -rf build
 	rm -rf bin
@@ -23,9 +23,9 @@ clean:
 	bash clean.sh
 
 deb:
-	$(MAKE) -C src/mysyslog deb
-	$(MAKE) -C src/client deb
-	$(MAKE) -C src/server deb
+	$(MAKE) -C mysyslog deb
+	$(MAKE) -C client deb
+	$(MAKE) -C server deb
 
 repo:
 	mkdir -p repo
